@@ -1,0 +1,295 @@
+#!/bin/bash
+
+# Create a dockerized wp site.
+# Author: Javier Troya
+
+BASE_DIR="/path/to/your/sites/directory"
+DOCKER_NETWORK_NAME="my_docker_network"
+WP_PUID=1001
+WP_PGID=1001
+TIMEZONE="Europe/Madrid"
+PHP_MEMORY_LIMIT="512M"
+PHP_UPLOAD_MAX_FILESIZE="100M"
+PHP_POST_MAX_SIZE="100M"
+PHP_MAX_EXECUTION_TIME="600"
+PHP_MAX_INPUT_TIME="600"
+NGINX_CLIENT_MAX_BODY_SIZE="100M"
+MARIADB_MAX_ALLOWED_PACKET="512M"
+MARIADB_WAIT_TIMEOUT="600"
+MARIADB_INTERACTIVE_TIMEOUT="600"
+
+generate_password() {
+    < /dev/urandom tr -dc A-Za-z0-9_.- | head -c "${1:-32}"
+    echo
+}
+
+sanitize_name() {
+    echo "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_.-]/-/g' | sed 's/--/-/g' | sed 's/^-//;s/-$//'
+}
+
+sanitize_for_mysql() {
+    echo "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/_/g' | sed 's/__/_/g' | sed 's/^_//;s/_$//'
+}
+
+DOMAIN_NAME=""
+WP_TABLE_PREFIX_PARAM=""
+
+while getopts ":-:" opt; do
+  case $opt in
+    -)
+      case $OPTARG in
+        dbprefix)
+          WP_TABLE_PREFIX_PARAM="${!OPTIND}"; OPTIND=$(( OPTIND + 1 ))
+          ;;
+        *)
+          echo "Invalid option: --$OPTARG" >&2
+          exit 1
+          ;;
+      esac
+      ;;
+    \?)
+      echo "Invalid option: -$OPTARG" >&2
+      exit 1
+      ;;
+  esac
+done
+shift $((OPTIND -1))
+
+
+if [ -z "$1" ]; then
+    echo "Usage: $0 <domain-name> [--dbprefix <your_prefix_>]"
+    echo "Example: $0 example.com"
+    echo "Example: $0 example.com --dbprefix abcdef_"
+    exit 1
+fi
+
+DOMAIN_NAME="$1"
+SANITIZED_NAME=$(sanitize_name "$DOMAIN_NAME")
+MARIADB_SANITIZED_NAME=$(sanitize_for_mysql "$DOMAIN_NAME")
+
+SITE_DIR="$BASE_DIR/$SANITIZED_NAME"
+WP_DB_NAME="${MARIADB_SANITIZED_NAME}_db"
+WP_DB_USER="${MARIADB_SANITIZED_NAME}_user"
+WP_DB_PREFIX=${}
+WP_DB_PASSWORD=$(generate_password 24)
+WP_REDIS_PASSWORD=$(generate_password 24)
+MARIADB_ROOT_PASSWORD=$(generate_password 32)
+
+if [ -z "$WP_TABLE_PREFIX_PARAM" ]; then
+    WP_DB_PREFIX="${MARIADB_SANITIZED_NAME}_$(generate_password 4)_"
+else
+    WP_DB_PREFIX="${WP_TABLE_PREFIX_PARAM}"
+fi
+
+if [[ "$WP_DB_PREFIX" != *_ ]]; then
+    echo "Warning: Provided database prefix '$WP_DB_PREFIX' does not end with '_'. Appending it for consistency."
+    WP_DB_PREFIX="${WP_DB_PREFIX}_"
+fi
+
+echo "Creando estructura de directorios para: $DOMAIN_NAME en $SITE_DIR"
+mkdir -p "$SITE_DIR"/{html,db_data,nginx,php-conf,mariadb-conf,redis_data}
+if [ $? -ne 0 ]; then
+    echo "ERROR: Could not create directory structure. Please check ussage and permissions."
+    exit 1
+fi
+echo "Created directories: html/, db_data/, nginx/, php-conf/, mariadb-conf"
+
+echo "Setting ownership and permissions for $SITE_DIR..."
+sudo chown -R ${WP_PUID}:${WP_PGID} "$SITE_DIR"
+sudo find "$SITE_DIR" -type d -exec chmod 775 {} \;
+sudo find "$SITE_DIR" -type f -exec chmod 664 {} \;
+sudo chmod g+s "$SITE_DIR"
+
+if [ $? -ne 0 ]; then
+    echo "ERROR: Could not set correct permissions or ownership. Aborting."
+    exit 1
+fi
+echo "Ownership and permissions set successfully."
+
+COMPOSE_FILE="$SITE_DIR/compose.yml"
+cat <<EOL > "$COMPOSE_FILE"
+services:
+  wordpress:
+    build: .
+    container_name: ${MARIADB_SANITIZED_NAME}_wordpress_fpm
+    restart: unless-stopped
+    volumes:
+      - ./html:/var/www/html
+      - ./php-conf/custom.ini:/usr/local/etc/php/conf.d/custom.ini:ro
+    environment:
+      WORDPRESS_DB_HOST: db:3306
+      WORDPRESS_DB_USER: ${WP_DB_USER}
+      WORDPRESS_DB_PASSWORD: ${WP_DB_PASSWORD}
+      WORDPRESS_DB_NAME: ${WP_DB_NAME}
+      WORDPRESS_TABLE_PREFIX: ${WP_DB_PREFIX}
+      WORDPRESS_CONFIG_EXTRA: "define('WP_ENVIRONMENT_TYPE', 'production');"
+      WORDPRESS_REDIS_HOST: redis
+      WORDPRESS_REDIS_PORT: 6379
+      WORDPRESS_REDIS_PASSWORD: "${WP_REDIS_PASSWORD}"
+      WORDPRESS_REDIS_DATABASE: 0
+      PUID: ${WP_PUID}
+      PGID: ${WP_PGID}
+      TZ: ${TIMEZONE}
+
+    depends_on:
+      - db
+      - redis
+    networks:
+      - ${DOCKER_NETWORK_NAME}
+      - internal_site_network
+
+  nginx:
+    image: nginx:stable-alpine
+    container_name: ${MARIADB_SANITIZED_NAME}_nginx
+    restart: unless-stopped
+    volumes:
+      - ./html:/var/www/html:ro
+      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - wordpress
+    networks:
+      - ${DOCKER_NETWORK_NAME}
+      - internal_site_network
+
+  db:
+    image: mariadb:latest
+    container_name: ${MARIADB_SANITIZED_NAME}_mariadb
+    restart: unless-stopped
+    volumes:
+      - ./db_data:/var/lib/mysql
+      - ./mariadb-conf/custom.cnf:/etc/mysql/conf.d/custom.cnf:ro
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${WP_DB_NAME}
+      MYSQL_USER: ${WP_DB_USER}
+      MYSQL_PASSWORD: ${WP_DB_PASSWORD}
+      TZ: ${TIMEZONE}
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MARIADB_ROOT_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - internal_site_network
+  redis:
+    image: redis:6-alpine
+    container_name: ${MARIADB_SANITIZED_NAME}_redis
+    restart: unless-stopped
+    volumes:
+      - ./redis_data:/data
+    command: redis-server --requirepass "${WP_REDIS_PASSWORD}"
+
+networks:
+  ${DOCKER_NETWORK_NAME}:
+    external: true
+
+  internal_site_network:
+    driver: bridge
+EOL
+echo "File $COMPOSE_FILE created succesfully."
+
+DOCKERFILE="${SITE_DIR}/Dockerfile"
+cat <<EOL > "$DOCKERFILE"
+FROM wordpress:fpm-alpine
+RUN set -ex; \
+    apk add --no-cache --virtual .build-deps \
+        \$PHPIZE_DEPS \
+        liblzf-dev \
+        zlib-dev \
+    ; \
+    \
+    pecl install redis; \
+    \
+    docker-php-ext-enable redis; \
+    \
+    apk del .build-deps
+EOL
+
+echo "File $DOCKERFILE created successfully."
+
+NGINX_CONF_FILE="$SITE_DIR/nginx/nginx.conf"
+cat <<EOL > "$NGINX_CONF_FILE"
+server {
+    listen 80;
+    server_name ${DOMAIN_NAME};
+
+    root /var/www/html;
+    index index.php index.html index.htm;
+
+    access_log /var/log/nginx/access.log;
+    error_log /var/log/nginx/error.log warn;
+
+    client_max_body_size 100M;
+
+    location / {
+        try_files \$uri \$uri/ /index.php?\$args;
+    }
+
+    location ~ \\.php\$ {
+        fastcgi_pass wordpress:9000;
+        fastcgi_index index.php;
+        include fastcgi_params;
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+        fastcgi_buffers 16 16k;
+        fastcgi_buffer_size 32k;
+        fastcgi_read_timeout 300s;
+    }
+
+    location ~ /\\.ht {
+        deny all;
+    }
+    location ~ /wp-content/uploads/.*\\.php\$ {
+        deny all;
+    }
+    location ~ /wp-config.php {
+        deny all;
+    }
+    location ~ /xmlrpc.php {
+        deny all;
+    }
+}
+EOL
+echo "File $NGINX_CONF_FILE created successfully."
+
+PHP_CONF_FILE="$SITE_DIR/php-conf/custom.ini"
+cat <<EOL > "$PHP_CONF_FILE"
+memory_limit = ${PHP_MEMORY_LIMIT}
+upload_max_filesize = ${PHP_UPLOAD_MAX_FILESIZE}
+post_max_size = ${PHP_POST_MAX_SIZE}
+max_execution_time = ${PHP_MAX_EXECUTION_TIME}
+max_input_time = ${PHP_MAX_INPUT_TIME}
+EOL
+echo "File $PHP_CONF_FILE created successfully."
+
+MARIADB_CONF_FILE="$SITE_DIR/mariadb-conf/custom.cnf"
+cat <<EOL > "$MARIADB_CONF_FILE"
+[mysqld]
+max_allowed_packet = ${MARIADB_MAX_ALLOWED_PACKET}
+wait_timeout = ${MARIADB_WAIT_TIMEOUT}
+interactive_timeout = ${MARIADB_INTERACTIVE_TIMEOUT}
+EOL
+echo "File $MARIADB_CONF_FILE created successfully."
+
+echo -e "\n--- Next steps for $DOMAIN_NAME} ---"
+echo "Site directory: $SITE_DIR"
+echo "WordPress DB Name: $WP_DB_NAME"
+echo "WordPress DB User: $WP_DB_USER"
+echo "WordPress DB Passwd: $WP_DB_PASSWORD"
+echo "MariaDB root passwd: $MARIADB_ROOT_PASSWORD"
+echo ""
+echo "1. Go to site directory:"
+echo "   cd $SITE_DIR"
+echo "2. Start the containers:"
+echo "   docker compose up -d"
+echo "3. Wait a few minutes untill services are started and DB is ready."
+echo "4. Access Nginx Proxy Manager:"
+echo "5. Go to 'Proxy Hosts' and add a new host for '${DOMAIN_NAME}':"
+echo "   - Domain Names: ${DOMAIN_NAME}"
+echo "   - Scheme: http"
+echo "   - Forward Hostname / IP: ${SANITIZED_NAME}_nginx"
+echo "   - Forward Port: 80"
+echo "   - Check 'Block Common Exploits'."
+echo "   - On 'SSL' tab, request a new Let's Encrypt certificate."
+echo "6. Once the cert is ready, browse to https://${DOMAIN_NAME} to finish WordPress install."
+echo "7. Set up an SMTP WordPress Plugin (ej. WP Mail SMTP) with your transaccional email provider (SendGrid, Mailgun, etc.)"
+echo -e "\nRemember to save the generated passwords in a safe place!"

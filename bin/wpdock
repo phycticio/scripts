@@ -1,0 +1,65 @@
+#!/bin/bash
+
+sanitize_for_mysql() {
+  echo "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/_/g' | sed 's/__/_/g' | sed 's/^_//;s/_$//'
+}
+
+if [[ "$PWD" =~ ^/home/wordpress/sites/([^/]+)/?$ ]]; then
+  DOMAIN_NAME_IN_DIR="${BASH_REMATCH[1]}"
+else
+  echo "Error: Not in a dockerized WordPress site directory."
+  echo "Expected path is /path/to/sites/directory/<domain_name>/"
+  echo "Usage: Navigate to your site directory (e.g., cd /path/to/sites/directory/example.com/) and run 'wp <wp_cli_command>'."
+  exit 1
+fi
+
+SITE_SANITIZED_NAME=$(sanitize_for_mysql "$DOMAIN_NAME_IN_DIR")
+PROJECT_NAME=$(sanitize_for_mysql "$DOMAIN_NAME_IN_DIR")
+
+WP_FPM_CONTAINER="${SITE_SANITIZED_NAME}_wordpress_fpm"
+MARIADB_CONTAINER="${SITE_SANITIZED_NAME}_mariadb"
+
+INTERNAL_SITE_NETWORK_NAME="${PROJECT_NAME}_internal_site_network"
+
+echo "DIR: $PWD"
+echo "Domain: ${DOMAIN_NAME_IN_DIR}"
+echo "Project: ${PROJECT_NAME}"
+echo "WP Container: ${WP_FPM_CONTAINER}"
+echo "DB Container: ${MARIADB_CONTAINER}"
+echo "Network: ${INTERNAL_SITE_NETWORK_NAME}"
+
+if ! docker ps --filter "name=${WP_FPM_CONTAINER}" --format "{{.Names}}" | grep -q "${WP_FPM_CONTAINER}"; then
+  echo "Error: WordPress container '${WP_FPM_CONTAINER}' is not running. Please start it with 'docker compose up -d' in this directory."
+  exit 1
+fi
+if ! docker ps --filter "name=${MARIADB_CONTAINER}" --format "{{.Names}}" | grep -q "${MARIADB_CONTAINER}"; then
+  echo "Error: MariaDB container '${MARIADB_CONTAINER}' is not running. Please start it with 'docker compose up -d' in this directory."
+  exit 1
+fi
+
+local MARIADB_IP=$(docker inspect "${MARIADB_CONTAINER}" --format='{{.NetworkSettings.Networks.'${INTERNAL_SITE_NETWORK_NAME}'.IPAddress}}')
+if [ -z "$MARIADB_IP" ]; then
+  echo "Error: Could not get IP address for MariaDB container '${MARIADB_CONTAINER}' in network '${INTERNAL_SITE_NETWORK_NAME}'. Check container status or network configuration."
+  exit 1
+fi
+echo "Debug: MariaDB IP for WP-CLI is: $MARIADB_IP"
+
+local SITE_COMPOSE_FILE="$PWD/compose.yml"
+local REAL_DB_NAME=$(grep "WORDPRESS_DB_NAME:" "$SITE_COMPOSE_FILE" | head -n 1 | awk '{print $2}' | tr -d '\r')
+local REAL_DB_USER=$(grep "WORDPRESS_DB_USER:" "$SITE_COMPOSE_FILE" | head -n 1 | awk '{print $2}' | tr -d '\r')
+local REAL_DB_PASSWORD=$(grep "WORDPRESS_DB_PASSWORD:" "$SITE_COMPOSE_FILE" | head -n 1 | awk '{print $2}' | tr -d '\r')
+local REAL_DB_PREFIX=$(grep "WORDPRESS_TABLE_PREFIX:" "$SITE_COMPOSE_FILE" | head -n 1 | awk '{print $2}' | tr -d '\r')
+
+echo "Table Prefix: ${REAL_DB_PREFIX}"
+
+docker run --rm \
+  --volumes-from "${WP_FPM_CONTAINER}" \
+  --network "${INTERNAL_SITE_NETWORK_NAME}" \
+  -e DB_HOST="${MARIADB_IP}" \
+  -e DB_NAME="${REAL_DB_NAME}" \
+  -e DB_USER="${REAL_DB_USER}" \
+  -e DB_PASSWORD="${REAL_DB_PASSWORD}" \
+  -e WP_TABLE_PREFIX="${REAL_DB_PREFIX}" \
+  -e MYSQL_CLIENT_FLAGS="--ssl-mode=DISABLED" \
+  wordpress:cli \
+  wp "$@"
